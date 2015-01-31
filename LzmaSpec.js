@@ -16,6 +16,9 @@ function InputStream(buffer) {
   this.processed = 0;
 }
 InputStream.prototype = {
+  get available() {
+    return this.buffer.length - this.processed;
+  },
   readByte: function () {
     if (this.processed >= this.buffer.length) {
       throw new Error("Unexpected end of file");
@@ -24,19 +27,25 @@ InputStream.prototype = {
   }
 };
 
-function OutStream() {
+function OutputStream() {
   this.buffer = new Uint8Array(128);
   this.processed = 0;
 }
 
-OutStream.prototype = {
-  writeByte: function (b) {
-    if (this.processed >= this.buffer.length) {
-      var newBuffer = new Uint8Array(this.buffer.length * 2);
+OutputStream.prototype = {
+  writeBytes: function (data) {
+    var needLength = this.processed + data.length;
+    if (needLength > this.buffer.length) {
+      var newLength = this.buffer.length * 2;
+      while (newLength < needLength) {
+        newLength *= 2;
+      }
+      var newBuffer = new Uint8Array(newLength);
       newBuffer.set(this.buffer);
       this.buffer = newBuffer;
     }
-    this.buffer[this.processed++] = b;
+    this.buffer.set(data, this.processed);
+    this.processed = needLength;
   },
   toUint8Array: function () {
     return this.buffer.subarray(0, this.processed);
@@ -49,6 +58,7 @@ function OutWindow(outStream) {
   this.pos = 0;
   this.size = 0;
   this.isFull = false;
+  this.writePos = 0;
 
   this.totalPos = 0;
 }
@@ -58,25 +68,31 @@ OutWindow.prototype = {
     this.pos = 0;
     this.size = dictSize;
     this.isFull = false;
+    this.writePos = 0;
     this.totalPos = 0;
   },
   putByte: function(b) {
     this.totalPos++;
     this.buf[this.pos++] = b;
     if (this.pos === this.size) {
+      this.flush();
       this.pos = 0;
       this.isFull = true;
     }
-    this.outStream.writeByte(b);
   },
   getByte: function (dist) {
     return this.buf[dist <= this.pos ? this.pos - dist : this.size - dist + this.pos];
+  },
+  flush: function () {
+    if (this.writePos < this.pos) {
+      this.outStream.writeBytes(this.buf.subarray(this.writePos, this.pos));
+      this.writePos = this.pos === this.size ? 0 : this.pos;
+    }
   },
   copyMatch: function (dist, len) {
     var pos = this.pos;
     var size = this.size;
     var buffer = this.buf;
-    var outStream = this.outStream;
     var getPos = dist <= pos ? pos - dist : size - dist + pos;
     var left = len;
     while (left > 0) {
@@ -84,9 +100,10 @@ OutWindow.prototype = {
       for (var i = 0; i < chunk; i++) {
         var b = buffer[getPos++];
         buffer[pos++] = b;
-        outStream.writeByte(b);
       }
       if (pos === size) {
+        this.pos = pos;
+        this.flush();
         pos = 0;
         this.isFull = true;
       }
@@ -287,6 +304,8 @@ function updateState_ShortRep(state) {
 
 var LZMA_DIC_MIN = 1 << 12;
 
+var MAX_DECODE_BITS_CALLS = 48;
+
 function LzmaDecoder(inStream, outStream) {
   this.rangeDec = new RangeDecoder(inStream);
   this.outWindow = new OutWindow(outStream);
@@ -297,6 +316,11 @@ function LzmaDecoder(inStream, outStream) {
   this.lp = 0;
   this.dictSize = 0;
   this.dictSizeInProperties = 0;
+  this.unpackSize = undefined;
+  this.leftToUnpack = undefined;
+
+  this.reps = new Int32Array(4);
+  this.state = 0;
 }
 LzmaDecoder.prototype = {
   decodeProperties: function(properties) {
@@ -319,6 +343,16 @@ LzmaDecoder.prototype = {
   },
   create: function() {
     this.outWindow.create(this.dictSize);
+
+    this.init();
+    this.rangeDec.init();
+
+    this.reps[0] = 0;
+    this.reps[1] = 0;
+    this.reps[2] = 0;
+    this.reps[3] = 0;
+    this.state = 0;
+    this.leftToUnpack = this.unpackSize;
   },
   decodeLiteral: function (state, rep0) {
     var outWindow = this.outWindow;
@@ -387,15 +421,13 @@ LzmaDecoder.prototype = {
     this.lenDecoder = new LenDecoder();
     this.repLenDecoder = new LenDecoder();
   },
-  decode: function(unpackSize) {
+  decode: function(notFinal) {
     var rangeDec = this.rangeDec;
     var outWindow = this.outWindow;
     var pb = this.pb;
     var dictSize = this.dictSize;
     var markerIsMandatory = this.markerIsMandatory;
-
-    this.init();
-    rangeDec.init();
+    var leftToUnpack = this.leftToUnpack;
 
     var isMatch = this.isMatch;
     var isRep = this.isRep;
@@ -406,11 +438,23 @@ LzmaDecoder.prototype = {
     var lenDecoder = this.lenDecoder;
     var repLenDecoder = this.repLenDecoder;
 
-    var rep0 = 0, rep1 = 0, rep2 = 0, rep3 = 0;
-    var state = 0;
+    var rep0 = this.reps[0];
+    var rep1 = this.reps[1];
+    var rep2 = this.reps[2];
+    var rep3 = this.reps[3];
+    var state = this.state;
 
     while (true) {
-      if (unpackSize === 0 && !markerIsMandatory) {
+      // Based on worse case scenario one byte consumed per decodeBit calls,
+      // reserving keeping some amount of bytes in the input stream for
+      // non-final data blocks.
+      if (notFinal && rangeDec.inStream.available < MAX_DECODE_BITS_CALLS) {
+        this.outWindow.flush();
+        break;
+      }
+
+      if (leftToUnpack === 0 && !markerIsMandatory) {
+        this.outWindow.flush();
         if (rangeDec.isFinishedOK()) {
           return LZMA_RES_FINISHED_WITHOUT_MARKER;
         }
@@ -419,18 +463,18 @@ LzmaDecoder.prototype = {
       var posState = outWindow.totalPos & ((1 << pb) - 1);
 
       if (rangeDec.decodeBit(isMatch, (state << kNumPosBitsMax) + posState) === 0) {
-        if (unpackSize === 0) {
+        if (leftToUnpack === 0) {
           return LZMA_RES_ERROR;
         }
         outWindow.putByte(this.decodeLiteral(state, rep0));
         state = updateState_Literal(state);
-        unpackSize--;
+        leftToUnpack--;
         continue;
       }
 
       var len;
       if (rangeDec.decodeBit(isRep, state) !== 0) {
-        if (unpackSize === 0) {
+        if (leftToUnpack === 0) {
           return LZMA_RES_ERROR;
         }
         if (outWindow.isEmpty()) {
@@ -440,7 +484,7 @@ LzmaDecoder.prototype = {
           if (rangeDec.decodeBit(isRep0Long, (state << kNumPosBitsMax) + posState) === 0) {
             state = updateState_ShortRep(state);
             outWindow.putByte(outWindow.getByte(rep0 + 1));
-            unpackSize--;
+            leftToUnpack--;
             continue;
           }
         } else {
@@ -469,12 +513,13 @@ LzmaDecoder.prototype = {
         state = updateState_Match(state);
         rep0 = this.decodeDistance(len);
         if (rep0 === -1) {
+          this.outWindow.flush();
           return rangeDec.isFinishedOK() ?
             LZMA_RES_FINISHED_WITH_MARKER :
             LZMA_RES_ERROR;
         }
 
-        if (unpackSize === 0) {
+        if (leftToUnpack === 0) {
           return LZMA_RES_ERROR;
         }
         if (rep0 >= dictSize || !outWindow.checkDistance(rep0)) {
@@ -483,22 +528,31 @@ LzmaDecoder.prototype = {
       }
       len += kMatchMinLen;
       var isError = false;
-      if (unpackSize !== undefined && unpackSize < len) {
-        len = unpackSize;
+      if (leftToUnpack !== undefined && leftToUnpack < len) {
+        len = leftToUnpack;
         isError = true;
       }
       outWindow.copyMatch(rep0 + 1, len);
-      unpackSize -= len;
+      leftToUnpack -= len;
       if (isError) {
         return LZMA_RES_ERROR;
       }
     }
+
+    this.state = state;
+    this.reps[0] = rep0;
+    this.reps[1] = rep1;
+    this.reps[2] = rep2;
+    this.reps[3] = rep3;
+    this.leftToUnpack = leftToUnpack;
+    return LZMA_RES_NOT_COMPLETE;
   }
 };
 
 var LZMA_RES_ERROR = 0;
 var LZMA_RES_FINISHED_WITH_MARKER = 1;
 var LZMA_RES_FINISHED_WITHOUT_MARKER = 2;
+var LZMA_RES_NOT_COMPLETE = 3;
 
 function decodeLzma(buffer) {
   if (!buffer) {
@@ -506,7 +560,7 @@ function decodeLzma(buffer) {
   }
 
   var inStream = new InputStream(buffer);
-  var outStream = new OutStream();
+  var outStream = new OutputStream();
 
   var lzmaDecoder = new LzmaDecoder(inStream, outStream);
 
@@ -527,18 +581,17 @@ function decodeLzma(buffer) {
     }
     unpackSize |= b << (8 * i);
   }
-  if (!unpackSizeDefined) {
-    unpackSize = undefined;
-  }
 
   lzmaDecoder.markerIsMandatory = !unpackSizeDefined;
-
+  lzmaDecoder.unpackSize = unpackSizeDefined ? unpackSize : undefined;
   lzmaDecoder.create();
-  var res = lzmaDecoder.decode(unpackSize);
+
+  var res = lzmaDecoder.decode(false);
 
   if (res === LZMA_RES_ERROR) {
     throw new Error("LZMA decoding error");
-  } else if (res === LZMA_RES_FINISHED_WITHOUT_MARKER) {
+  } else if (res === LZMA_RES_NOT_COMPLETE) {
+    throw new Error("Decoding is not complete");
   } else if (res === LZMA_RES_FINISHED_WITH_MARKER) {
     if (unpackSizeDefined) {
       if (lzmaDecoder.outWindow.outStream.processed != unpackSize) {
